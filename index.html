@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Stations of the Cross PDF Viewer United States</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #111;
+    overflow: hidden;
+    font-family: Arial, sans-serif;
+  }
+
+  /* ===== TOOLBAR ===== */
+  .toolbar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 44px;
+    background: rgba(0,0,0,0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    z-index: 1000;
+  }
+
+  .toolbar button {
+    background: #fff;
+    border: none;
+    padding: 6px 12px;
+    font-size: 14px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  /* ===== VIEWER ===== */
+  #viewer-container {
+    position: absolute;
+    top: 44px;
+    bottom: 44px;
+    left: 0;
+    right: 0;
+    overflow: hidden;
+    touch-action: none;
+  }
+
+  #viewer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform-origin: 0 0;
+    cursor: grab;
+    will-change: transform;
+    transform: translateZ(0);
+  }
+
+  #viewer.dragging { cursor: grabbing; }
+
+  /* Pages are absolutely positioned inside viewer */
+  .page-shell {
+    position: absolute;
+    left: 0;
+    width: 100%;
+    display: flex;
+    justify-content: center;
+  }
+
+  /* white page background */
+  .page-canvas {
+    background: #fff;
+    display: block;
+  }
+
+  /* Placeholder (when not rendered) */
+  .page-placeholder {
+    background: #fff;
+    opacity: 0.10;
+  }
+
+  /* ===== BOTTOM BAR ===== */
+  .page-nav {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 44px;
+    background: rgba(0,0,0,0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    z-index: 1000;
+    color: #fff;
+    font-size: 14px;
+  }
+
+  .page-nav button {
+    background: #fff;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  @media (max-width: 768px) {
+    .toolbar, .page-nav { height: 50px; }
+    #viewer-container { top: 50px; bottom: 50px; }
+  }
+</style>
+</head>
+
+<body>
+
+<div class="toolbar">
+  <button onclick="zoomOut()">−</button>
+  <button onclick="zoomIn()">+</button>
+  <button onclick="toggleFullscreen()">⤢ Fullscreen</button>
+</div>
+
+<div id="viewer-container">
+  <div id="viewer"></div>
+</div>
+
+<div class="page-nav">
+  <button onclick="prevPage()">◀</button>
+  <span id="pageIndicator">Loading…</span>
+  <button onclick="nextPage()">▶</button>
+</div>
+
+<script>
+  // ✅ Update to your PDF file name:
+  const url = './Stations_of_the_Cross_Instructions_United_States.pdf';
+
+  let pdfDoc = null;
+  let totalPages = 0;
+
+  // ✅ Start more zoomed out
+  let scale = window.innerWidth < 768 ? 0.22 : 0.30;
+  const MIN_SCALE = 0.12;
+  const MAX_SCALE = 4;
+
+  // Pan offsets
+  let x = 0;
+  let y = 0;
+
+  // Smooth transform
+  let rafPending = false;
+
+  const viewer = document.getElementById('viewer');
+  const container = document.getElementById('viewer-container');
+  const indicator = document.getElementById('pageIndicator');
+
+  // Layout data at scale=1
+  const PAGE_GAP = 24;
+  let stripWidth = 0;      // max page width at scale=1
+  let stripHeight = 0;     // total stack height at scale=1
+  let pageRects = [];      // [{page, yTop, yBottom, width, height}]
+  let pageNodes = [];      // [{shell, canvasOrPlaceholder, rendered, rendering, renderScale}]
+
+  // Lazy render settings (tune for future-proofing)
+  const RENDER_AHEAD_PX = 1200;   // render pages within +/- this range (screen px)
+  const UNLOAD_BEHIND_PX = 2400;  // unload pages beyond this range (screen px)
+  const RENDER_SCALE_BASE = 1.5;  // internal render detail; increased dynamically with zoom (below)
+
+  let currentPage = 1;
+
+  // Basic render queue guard
+  let renderTickScheduled = false;
+
+  pdfjsLib.getDocument(url).promise.then(async pdf => {
+    pdfDoc = pdf;
+    totalPages = pdf.numPages;
+    await buildLazyLayout();
+    resetView();
+    updateIndicator();
+    scheduleRenderTick();
+  });
+
+  async function buildLazyLayout() {
+    viewer.innerHTML = '';
+    pageRects = [];
+    pageNodes = [];
+
+    // 1) Measure all pages at scale=1 (fast; no drawing)
+    stripWidth = 0;
+    stripHeight = 0;
+
+    const viewports = [];
+    for (let i = 1; i <= totalPages; i++) {
+      const page = await pdfDoc.getPage(i);
+      const vp = page.getViewport({ scale: 1 });
+      viewports.push(vp);
+      stripWidth = Math.max(stripWidth, Math.ceil(vp.width));
+    }
+
+    // 2) Compute stacked height and rects
+    let yCursor = 0;
+    for (let i = 1; i <= totalPages; i++) {
+      const vp = viewports[i - 1];
+      const h = Math.ceil(vp.height);
+      const w = Math.ceil(vp.width);
+
+      pageRects.push({
+        page: i,
+        yTop: yCursor,
+        yBottom: yCursor + h,
+        width: w,
+        height: h
+      });
+
+      yCursor += h + (i === totalPages ? 0 : PAGE_GAP);
+    }
+    stripHeight = yCursor;
+
+    // 3) Create shells + placeholders (no heavy render yet)
+    // viewer acts as the "world" we pan/zoom around
+    // give viewer enough size so we can compute positions in "pdf coords"
+    viewer.style.width = stripWidth + 'px';
+    viewer.style.height = stripHeight + 'px';
+
+    for (let i = 1; i <= totalPages; i++) {
+      const r = pageRects[i - 1];
+
+      const shell = document.createElement('div');
+      shell.className = 'page-shell';
+      shell.style.top = r.yTop + 'px';
+      shell.style.height = r.height + 'px';
+
+      // Placeholder div (lightweight)
+      const ph = document.createElement('div');
+      ph.className = 'page-placeholder';
+      ph.style.width = r.width + 'px';
+      ph.style.height = r.height + 'px';
+
+      shell.appendChild(ph);
+      viewer.appendChild(shell);
+
+      pageNodes.push({
+        shell,
+        node: ph,          // placeholder or canvas
+        rendered: false,
+        rendering: false,
+        renderScale: 0
+      });
+    }
+  }
+
+  function resetView() {
+    // center horizontally, start near top
+    x = (container.clientWidth - stripWidth * scale) / 2;
+    y = 20;
+    applyTransform();
+  }
+
+  function applyTransform() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(() => {
+      viewer.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+      rafPending = false;
+      updateIndicator();
+      scheduleRenderTick();
+    });
+  }
+
+  function clampScale(s) {
+    return Math.min(Math.max(MIN_SCALE, s), MAX_SCALE);
+  }
+
+  function zoomAtPoint(delta, cx, cy) {
+    const prev = scale;
+    scale = clampScale(scale + delta);
+
+    const dx = cx - x;
+    const dy = cy - y;
+    x -= dx * (scale / prev - 1);
+    y -= dy * (scale / prev - 1);
+
+    applyTransform();
+  }
+
+  function zoomIn() {
+    zoomAtPoint(0.15, container.clientWidth / 2, container.clientHeight / 2);
+  }
+  function zoomOut() {
+    zoomAtPoint(-0.15, container.clientWidth / 2, container.clientHeight / 2);
+  }
+  function toggleFullscreen() {
+    if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+    else document.exitFullscreen();
+  }
+
+  function updateIndicator() {
+    // find which page is closest to viewport center
+    const viewCenterY = (container.clientHeight / 2 - y) / scale;
+
+    let best = 1;
+    for (const r of pageRects) {
+      if (viewCenterY >= r.yTop && viewCenterY <= r.yBottom) { best = r.page; break; }
+      if (viewCenterY > r.yBottom) best = r.page;
+    }
+    currentPage = best;
+    indicator.textContent = `Page ${currentPage} / ${totalPages}`;
+  }
+
+  function scrollToPage(n) {
+    const r = pageRects.find(p => p.page === n);
+    if (!r) return;
+    // align page top near top
+    y = 20 - r.yTop * scale;
+    applyTransform();
+  }
+
+  function nextPage() { if (currentPage < totalPages) scrollToPage(currentPage + 1); }
+  function prevPage() { if (currentPage > 1) scrollToPage(currentPage - 1); }
+
+  /* ===== LAZY RENDER CORE ===== */
+  function scheduleRenderTick() {
+    if (renderTickScheduled) return;
+    renderTickScheduled = true;
+    requestAnimationFrame(() => {
+      renderTickScheduled = false;
+      renderVisiblePages();
+    });
+  }
+
+  function renderVisiblePages() {
+    if (!pdfDoc) return;
+
+    // compute visible range in PDF coords (scale=1 space)
+    const topPdfY = (0 - y) / scale;
+    const bottomPdfY = (container.clientHeight - y) / scale;
+
+    // convert render/unload thresholds from screen px to pdf coords
+    const aheadPdf = RENDER_AHEAD_PX / scale;
+    const unloadPdf = UNLOAD_BEHIND_PX / scale;
+
+    const wantTop = topPdfY - aheadPdf;
+    const wantBottom = bottomPdfY + aheadPdf;
+
+    const unloadTop = topPdfY - unloadPdf;
+    const unloadBottom = bottomPdfY + unloadPdf;
+
+    // choose a render scale that increases with zoom, but capped
+    // (so when user zooms in, pages re-render sharper only if needed)
+    const desiredRenderScale = Math.min(3.0, Math.max(1.0, RENDER_SCALE_BASE * scale * 1.2));
+
+    for (let i = 0; i < pageRects.length; i++) {
+      const r = pageRects[i];
+      const node = pageNodes[i];
+
+      const intersectsWanted = !(r.yBottom < wantTop || r.yTop > wantBottom);
+      const outsideUnload = (r.yBottom < unloadTop || r.yTop > unloadBottom);
+
+      if (intersectsWanted) {
+        // render if missing or too low-res for current zoom
+        if (!node.rendering && (!node.rendered || node.renderScale < desiredRenderScale - 0.25)) {
+          renderPageIntoNode(i, desiredRenderScale);
+        }
+      } else if (outsideUnload) {
+        // unload far pages to keep memory low
+        if (node.rendered && !node.rendering) {
+          unloadPageNode(i);
+        }
+      }
+    }
+  }
+
+  async function renderPageIntoNode(index, renderScale) {
+    const r = pageRects[index];
+    const node = pageNodes[index];
+    node.rendering = true;
+
+    try {
+      const page = await pdfDoc.getPage(r.page);
+
+      const vp = page.getViewport({ scale: renderScale });
+      const canvas = document.createElement('canvas');
+      canvas.className = 'page-canvas';
+      canvas.width = Math.floor(vp.width);
+      canvas.height = Math.floor(vp.height);
+
+      // Keep CSS size in "scale=1 space" so the outer viewer transform handles zoom
+      canvas.style.width = r.width + 'px';
+      canvas.style.height = r.height + 'px';
+
+      const ctx = canvas.getContext('2d', { alpha: false });
+
+      // render at higher internal res, then displayed at base size
+      await page.render({ canvasContext: ctx, viewport: vp }).promise;
+
+      // swap placeholder -> canvas
+      node.shell.innerHTML = '';
+      node.shell.appendChild(canvas);
+
+      node.node = canvas;
+      node.rendered = true;
+      node.renderScale = renderScale;
+    } catch (e) {
+      // if something fails, keep placeholder
+      // (silently, so viewer doesn't break)
+    } finally {
+      node.rendering = false;
+    }
+  }
+
+  function unloadPageNode(index) {
+    const r = pageRects[index];
+    const node = pageNodes[index];
+
+    // replace canvas with placeholder again
+    const ph = document.createElement('div');
+    ph.className = 'page-placeholder';
+    ph.style.width = r.width + 'px';
+    ph.style.height = r.height + 'px';
+
+    node.shell.innerHTML = '';
+    node.shell.appendChild(ph);
+
+    node.node = ph;
+    node.rendered = false;
+    node.renderScale = 0;
+  }
+
+  /* ===== PAN / DRAG (ALL DEVICES) ===== */
+  let dragging = false;
+  let startX, startY;
+
+  container.addEventListener('pointerdown', e => {
+    dragging = true;
+    viewer.classList.add('dragging');
+    startX = e.clientX - x;
+    startY = e.clientY - y;
+  });
+
+  window.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    x = e.clientX - startX;
+    y = e.clientY - startY;
+    applyTransform();
+  });
+
+  window.addEventListener('pointerup', () => {
+    dragging = false;
+    viewer.classList.remove('dragging');
+  });
+
+  /* ===== DESKTOP WHEEL ZOOM ===== */
+  container.addEventListener('wheel', e => {
+    e.preventDefault();
+    const delta = e.deltaY < 0 ? 0.10 : -0.10;
+    zoomAtPoint(delta, e.offsetX, e.offsetY);
+  }, { passive: false });
+
+  /* ===== MOBILE PINCH ZOOM ===== */
+  let lastDistance = null;
+
+  container.addEventListener('touchstart', e => {
+    if (e.touches.length === 2) {
+      lastDistance = getDistance(e.touches[0], e.touches[1]);
+    }
+  }, { passive: false });
+
+  container.addEventListener('touchmove', e => {
+    if (e.touches.length === 2 && lastDistance !== null) {
+      e.preventDefault();
+      const currentDistance = getDistance(e.touches[0], e.touches[1]);
+      const delta = (currentDistance - lastDistance) * 0.0016;
+
+      const rect = container.getBoundingClientRect();
+      const centerX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+      const centerY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+
+      zoomAtPoint(delta, centerX, centerY);
+      lastDistance = currentDistance;
+    }
+  }, { passive: false });
+
+  container.addEventListener('touchend', () => {
+    lastDistance = null;
+  });
+
+  function getDistance(t1, t2) {
+    return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+  }
+
+  /* ===== DOUBLE TAP ZOOM ===== */
+  let lastTap = 0;
+  container.addEventListener('click', () => {
+    const now = Date.now();
+    if (now - lastTap < 300) {
+      zoomAtPoint(
+        scale > 1 ? -scale + 0.8 : 0.6,
+        container.clientWidth / 2,
+        container.clientHeight / 2
+      );
+    }
+    lastTap = now;
+  });
+
+  // expose for inline onclick
+  window.zoomIn = zoomIn;
+  window.zoomOut = zoomOut;
+  window.toggleFullscreen = toggleFullscreen;
+  window.nextPage = nextPage;
+  window.prevPage = prevPage;
+</script>
+
+</body>
+</html>
